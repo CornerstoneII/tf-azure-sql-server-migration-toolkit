@@ -18,7 +18,7 @@ terraform {
 
 provider "azurerm" {
   features {}
-  subscription_id = ""
+  subscription_id = "52f9cc50-7e1e-4e82-b8c3-da2757e84a48"
 }
 
 # Variables for SQL VM
@@ -279,18 +279,14 @@ resource "time_sleep" "wait_for_storage" {
   create_duration = "90s"
 }
 
-# Upload SQL script to storage with proper template processing
+# Upload SQL script to storage with templatefile processing
 resource "azurerm_storage_blob" "sql_script" {
-  name                   = "sql-setup.ps1"
+  name                   = "sql-setup-v2.ps1"
   storage_account_name   = azurerm_storage_account.backup.name
   storage_container_name = azurerm_storage_container.scripts.name
   type                   = "Block"
-  source_content = templatefile("${path.module}/sql-setup.ps1", {
-    storage_account_name = azurerm_storage_account.backup.name
-    storage_account_key  = azurerm_storage_account.backup.primary_access_key
-    share_name           = azurerm_storage_share.backupshare.name
-    drive_letter         = var.mount_drive_letter
-  })
+  source = "${path.module}/sql-setup.ps1"
+  content_md5 = filemd5("${path.module}/sql-setup.ps1")
 
   depends_on = [
     azurerm_storage_account.backup,
@@ -300,18 +296,13 @@ resource "azurerm_storage_blob" "sql_script" {
   ]
 }
 
-# Upload BETA01 script to storage with proper template processing
+# Upload BETA01 script to storage with templatefile processing
 resource "azurerm_storage_blob" "beta01_script" {
   name                   = "beta01-setup.ps1"
   storage_account_name   = azurerm_storage_account.backup.name
   storage_container_name = azurerm_storage_container.scripts.name
   type                   = "Block"
-  source_content = templatefile("${path.module}/beta01-setup.ps1", {
-    storage_account_name = azurerm_storage_account.backup.name
-    storage_account_key  = azurerm_storage_account.backup.primary_access_key
-    share_name           = azurerm_storage_share.backupshare.name
-    drive_letter         = var.mount_drive_letter
-  })
+  source = "${path.module}/beta01-setup.ps1"
 
   depends_on = [
     azurerm_storage_account.backup,
@@ -336,7 +327,7 @@ resource "azurerm_virtual_machine_extension" "sql_combined" {
   protected_settings = jsonencode({
     storageAccountName = azurerm_storage_account.backup.name
     storageAccountKey  = azurerm_storage_account.backup.primary_access_key
-    commandToExecute   = "powershell -ExecutionPolicy Unrestricted -File sql-setup.ps1 -StorageAccountName \"${azurerm_storage_account.backup.name}\" -StorageAccountKey \"${azurerm_storage_account.backup.primary_access_key}\" -ShareName \"${azurerm_storage_share.backupshare.name}\" -DriveLetter \"${var.mount_drive_letter}\""
+    commandToExecute   = "powershell -ExecutionPolicy Unrestricted -File sql-setup-v2.ps1 -StorageAccountName \"${azurerm_storage_account.backup.name}\" -StorageAccountKey \"${azurerm_storage_account.backup.primary_access_key}\" -ShareName \"${azurerm_storage_share.backupshare.name}\" -DriveLetter \"${var.mount_drive_letter}\" -SqlPassword \"${var.sql_password}\""
   })
 
   depends_on = [
