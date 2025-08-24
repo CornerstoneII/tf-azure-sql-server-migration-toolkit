@@ -162,7 +162,7 @@ resource "azurerm_managed_disk" "data" {
   resource_group_name  = var.sql_rg
   storage_account_type = "StandardSSD_LRS"
   create_option        = "Empty"
-  disk_size_gb         = 32
+  disk_size_gb         = 64
 }
 
 resource "azurerm_virtual_machine_data_disk_attachment" "data" {

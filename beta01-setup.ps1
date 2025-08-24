@@ -1,4 +1,4 @@
-# SQL Server VM Setup Script - Corrected Version
+# BETA01 VM Setup Script
 param(
     [Parameter(Mandatory=$true)]
     [string]$StorageAccountName,
@@ -21,59 +21,22 @@ function Write-Log {
 
     # Also write to a log file
     try {
-        $logFile = "C:\sql-setup.log"
+        $logFile = "C:\beta01-setup.log"
         Add-Content -Path $logFile -Value $logMessage -ErrorAction SilentlyContinue
     } catch {
         # Ignore logging errors
     }
 }
 
-Write-Log "=== SQL Server VM Setup Starting ==="
+Write-Log "=== BETA01 VM Setup Starting ==="
 Write-Log "Storage Account: $StorageAccountName"
 Write-Log "Share Name: $ShareName"
 Write-Log "Drive Letter: $DriveLetter"
 Write-Log "Storage Key Length: $($StorageAccountKey.Length) characters"
 
 try {
-    # Step 1: Create SQLBackups directory on SQL Server
-    Write-Log "=== STEP 1: Creating SQLBackups directory on SQL Server ==="
-    $sqlBackupsPath = "F:\SQLBackups"
-
-    if (-not (Test-Path $sqlBackupsPath)) {
-        Write-Log "Creating SQLBackups directory: $sqlBackupsPath"
-        New-Item -Path $sqlBackupsPath -ItemType Directory -Force | Out-Null
-        Write-Log "SQLBackups directory created successfully"
-    } else {
-        Write-Log "SQLBackups directory already exists: $sqlBackupsPath"
-    }
-
-    # Step 2: Install SSMS
-    Write-Log "=== STEP 2: Installing SSMS ==="
-    Write-Log "Downloading SSMS installer..."
-    $ssmsPath = "C:\ssms.exe"
-
-    # Use TLS 1.2 for download
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-    Invoke-WebRequest -Uri "https://aka.ms/ssmsfullsetup" -OutFile $ssmsPath -UseBasicParsing -TimeoutSec 300
-    Write-Log "SSMS installer downloaded successfully"
-
-    Write-Log "Starting SSMS installation (this may take several minutes)..."
-    $installProcess = Start-Process $ssmsPath -ArgumentList '/Quiet /Install' -Wait -PassThru
-
-    if ($installProcess.ExitCode -eq 0) {
-        Write-Log "SSMS installation completed successfully"
-    } else {
-        Write-Log "SSMS installation completed with exit code: $($installProcess.ExitCode)" "WARNING"
-    }
-
-    # Clean up installer
-    if (Test-Path $ssmsPath) {
-        Remove-Item $ssmsPath -Force -ErrorAction SilentlyContinue
-    }
-
-    # Step 3: Network and Storage Validation
-    Write-Log "=== STEP 3: Network and Storage Validation ==="
+    # Step 1: Network and Storage Validation
+    Write-Log "=== STEP 1: Network and Storage Validation ==="
     $fqdn = "$StorageAccountName.file.core.windows.net"
 
     Write-Log "Testing network connectivity to $fqdn on port 445..."
@@ -119,8 +82,8 @@ try {
         exit 1
     }
 
-    # Step 4: Mount Azure File Share
-    Write-Log "=== STEP 4: Mounting Azure File Share ==="
+    # Step 2: Mount Azure File Share on BETA01
+    Write-Log "=== STEP 2: Mounting Azure File Share on BETA01 ==="
     $drivePath = "$DriveLetter" + ":"
 
     Write-Log "Attempting to mount Azure File Share..."
@@ -194,20 +157,24 @@ try {
         }
     }
 
-    # Step 5: Wait and then copy backup files from file share to SQL Server
-    Write-Log "=== STEP 5: Copying backup files from Azure File Share to SQL Server ==="
-    # Wait for BETA01 to potentially copy files first
-    Write-Log "Waiting 60 seconds for BETA01 backup copy to complete..."
-    Start-Sleep -Seconds 60
-
+    # Step 3: Copy backup files from BETA01 to file share
+    Write-Log "=== STEP 3: Copying backup files from BETA01 to Azure File Share ==="
+    $sourcePath = "F:\SQLBackups"
     $mountedDrive = "$DriveLetter" + ":"
-    $sourceFolder = "SQLBACKUPS"
-    $destinationPath = "F:\SQLBackups"
-    $sourcePath = "$mountedDrive\$sourceFolder"
+    $destinationFolder = "SQLBACKUPS"
+    $destinationPath = "$mountedDrive\$destinationFolder"
 
-    Write-Log "Starting backup file copy from Azure File Share to SQL Server..."
+    Write-Log "Starting backup file copy from BETA01 to Azure File Share..."
     Write-Log "Source: $sourcePath"
     Write-Log "Destination: $destinationPath"
+
+    # Verify source directory exists
+    if (-not (Test-Path $sourcePath)) {
+        Write-Log "Source path '$sourcePath' does not exist! Skipping backup copy."
+        Write-Log "This is normal if BETA01 doesn't have SQL backup files."
+        Write-Log "=== BETA01 VM Configuration Completed (No source directory) ==="
+        exit 0
+    }
 
     # Verify mounted drive exists
     if (-not (Test-Path $mountedDrive)) {
@@ -215,18 +182,11 @@ try {
         throw "Mounted drive not available"
     }
 
-    # Verify source folder exists
-    if (-not (Test-Path $sourcePath)) {
-        Write-Log "Source folder '$sourcePath' does not exist! Backup files may not have been copied yet."
-        Write-Log "This is normal if BETA01 doesn't have backup files or hasn't completed its copy yet."
-        Write-Log "=== SQL Server VM Configuration Completed (No backups to copy) ==="
-        exit 0
-    }
-
-    # Create destination directory if it doesn't exist
+    # Verify destination folder exists
     if (-not (Test-Path $destinationPath)) {
-        Write-Log "Creating destination directory: $destinationPath"
+        Write-Log "Destination folder '$destinationPath' does not exist! Creating it..."
         New-Item -Path $destinationPath -ItemType Directory -Force | Out-Null
+        Write-Log "Destination folder created successfully"
     }
 
     # Get all .bak files from source
@@ -234,7 +194,8 @@ try {
 
     if ($backupFiles.Count -eq 0) {
         Write-Log "No .bak files found in '$sourcePath'"
-        Write-Log "=== SQL Server VM Configuration Completed (No .bak files to copy) ==="
+        Write-Log "This is normal if BETA01 doesn't have backup files yet."
+        Write-Log "=== BETA01 VM Configuration Completed (No .bak files found) ==="
         exit 0
     }
 
@@ -243,44 +204,57 @@ try {
         Write-Log "  - $($file.Name) ($([math]::Round($file.Length/1MB, 2)) MB)"
     }
 
-    # Copy each backup file
+    # Copy each backup file with retry logic
     $successCount = 0
     $errorCount = 0
 
     foreach ($file in $backupFiles) {
-        try {
-            $destinationFile = Join-Path $destinationPath $file.Name
+        $copySuccess = $false
 
-            Write-Log "Copying: $($file.Name)..."
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+                $destinationFile = Join-Path $destinationPath $file.Name
 
-            # Check if file already exists and compare sizes
-            if (Test-Path $destinationFile) {
-                $destFile = Get-Item $destinationFile
-                if ($destFile.Length -eq $file.Length) {
-                    Write-Log "  [SKIPPED - Already exists with same size]"
-                    continue
+                Write-Log "Copying: $($file.Name) (attempt $attempt)..."
+
+                # Check if file already exists and compare sizes
+                if (Test-Path $destinationFile) {
+                    $destFile = Get-Item $destinationFile
+                    if ($destFile.Length -eq $file.Length) {
+                        Write-Log "  [SKIPPED - Already exists with same size]"
+                        $copySuccess = $true
+                        break
+                    }
                 }
-            }
 
-            Copy-Item -Path $file.FullName -Destination $destinationFile -Force
+                Copy-Item -Path $file.FullName -Destination $destinationFile -Force
 
-            # Verify copy was successful
-            if (Test-Path $destinationFile) {
-                $copiedFile = Get-Item $destinationFile
-                if ($copiedFile.Length -eq $file.Length) {
-                    Write-Log "  [SUCCESS]"
-                    $successCount++
+                # Verify copy was successful
+                Start-Sleep -Seconds 2
+                if (Test-Path $destinationFile) {
+                    $copiedFile = Get-Item $destinationFile
+                    if ($copiedFile.Length -eq $file.Length) {
+                        Write-Log "  [SUCCESS]"
+                        $successCount++
+                        $copySuccess = $true
+                        break
+                    } else {
+                        Write-Log "  [RETRY - Size mismatch on attempt $attempt]"
+                        if ($attempt -lt 3) { Start-Sleep -Seconds 5 }
+                    }
                 } else {
-                    Write-Log "  [ERROR - Size mismatch]"
-                    $errorCount++
+                    Write-Log "  [RETRY - File not found after copy on attempt $attempt]"
+                    if ($attempt -lt 3) { Start-Sleep -Seconds 5 }
                 }
-            } else {
-                Write-Log "  [ERROR - File not found after copy]"
-                $errorCount++
-            }
 
-        } catch {
-            Write-Log "  [ERROR: $($_.Exception.Message)]"
+            } catch {
+                Write-Log "  [RETRY - Error on attempt $attempt : $($_.Exception.Message)]"
+                if ($attempt -lt 3) { Start-Sleep -Seconds 10 }
+            }
+        }
+
+        if (-not $copySuccess) {
+            Write-Log "  [FINAL ERROR - All attempts failed for $($file.Name)]"
             $errorCount++
         }
     }
@@ -290,7 +264,11 @@ try {
     Write-Log "  Errors: $errorCount files"
     Write-Log "  Total files processed: $($backupFiles.Count)"
 
-    Write-Log "=== SQL Server VM Configuration Completed ==="
+    if ($successCount -gt 0) {
+        Write-Log "✓ Successfully copied $successCount backup files to Azure File Share"
+    }
+
+    Write-Log "=== BETA01 VM Configuration Completed ==="
 
 } catch {
     Write-Log "Script execution failed: $($_.Exception.Message)" "ERROR"
