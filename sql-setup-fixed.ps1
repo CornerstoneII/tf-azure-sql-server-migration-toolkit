@@ -264,8 +264,8 @@ try {
     Write-Log "  Errors: $errorCount files"
     Write-Log "  Total files processed: $($backupFiles.Count)"
 
-    # Step 6: Restore databases from local backup files
-    Write-Log "=== STEP 6: Restoring databases from local backup files ==="
+    # Step 6: Restore databases using Yoda account
+    Write-Log "=== STEP 6: Restoring databases using Yoda account ==="
     $localBackupPath = "F:\SQLBackups"
 
     $localBackupFiles = Get-ChildItem -Path $localBackupPath -Filter "*.bak" -File -ErrorAction SilentlyContinue
@@ -278,13 +278,14 @@ try {
         Write-Log "Waiting for SQL Server service to be ready..."
         Start-Sleep -Seconds 30
 
+        # Test SQL Server connectivity with Yoda
         $sqlReady = $false
         for ($i = 1; $i -le 5; $i++) {
             try {
-                Write-Log "Testing SQL Server connectivity (attempt $i/5)..."
+                Write-Log "Testing SQL Server connectivity with Yoda (attempt $i/5)..."
                 $testResult = sqlcmd -S localhost -U Yoda -P "$SqlPassword" -Q "SELECT @@VERSION" -b -t 10
                 if ($LASTEXITCODE -eq 0) {
-                    Write-Log "SQL Server is ready"
+                    Write-Log "SQL Server ready with Yoda authentication"
                     $sqlReady = $true
                     break
                 }
@@ -299,7 +300,7 @@ try {
             Write-Log "SQL Server did not become ready after 5 attempts" "ERROR"
             Write-Log "Skipping database restore - manual restore required"
         } else {
-            Write-Log "Enabling advanced SQL Server options..."
+            Write-Log "Enabling advanced SQL Server options using Yoda..."
             $enableCmd = "EXEC sp_configure 'show advanced options', 1; RECONFIGURE; EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE;"
             sqlcmd -S localhost -U Yoda -P "$SqlPassword" -Q "$enableCmd" -b -t 30
 
@@ -322,7 +323,7 @@ try {
                 $backupFile = "F:\SQLBackups\$($db.File)"
 
                 if (Test-Path $backupFile) {
-                    Write-Log "Restoring database: $($db.Name) from $backupFile"
+                    Write-Log "Restoring database: $($db.Name) from $backupFile using Yoda"
 
                     $restoreCmd = "USE [master]; RESTORE DATABASE [$($db.Name)] FROM DISK = N'$backupFile' WITH FILE = 1, NOUNLOAD, REPLACE, STATS = 5"
 
@@ -330,7 +331,7 @@ try {
                     $restoreResult = sqlcmd -S localhost -U Yoda -P "$SqlPassword" -Q "$restoreCmd" -b -t 1800
 
                     if ($LASTEXITCODE -eq 0) {
-                        Write-Log "SUCCESS: $($db.Name) restored successfully"
+                        Write-Log "SUCCESS: $($db.Name) restored successfully by Yoda"
                         $restoredCount++
                     } else {
                         Write-Log "ERROR: $($db.Name) restore failed (Exit Code: $LASTEXITCODE)" "ERROR"
@@ -357,7 +358,7 @@ try {
                 }
             }
 
-            Write-Log "Successfully restored $restoredCount out of $($databases.Count) databases"
+            Write-Log "Successfully restored $restoredCount out of $($databases.Count) databases using Yoda"
         }
     }
 

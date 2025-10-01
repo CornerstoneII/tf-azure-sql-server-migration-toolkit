@@ -129,6 +129,18 @@ resource "azurerm_network_interface" "win" {
   }
 }
 
+# Create User-Assigned Managed Identity for SQL operations
+resource "azurerm_user_assigned_identity" "sql_managed_identity" {
+  name                = "mi-sql-tst-win"
+  resource_group_name = var.sql_rg
+  location            = var.location
+
+  tags = {
+    Purpose = "Managed identity for SQL Server database operations"
+    Project = "SQL-Migration"
+  }
+}
+
 # Create WIN Server VM
 resource "azurerm_windows_virtual_machine" "win" {
   name                = var.win_vm_name
@@ -140,6 +152,11 @@ resource "azurerm_windows_virtual_machine" "win" {
   network_interface_ids = [
     azurerm_network_interface.win.id,
   ]
+
+  identity {
+    type         = "UserAssigned"
+    identity_ids = [azurerm_user_assigned_identity.sql_managed_identity.id]
+  }
 
   os_disk {
     caching              = "ReadWrite"
