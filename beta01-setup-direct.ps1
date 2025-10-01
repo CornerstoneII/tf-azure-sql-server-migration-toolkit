@@ -1,4 +1,4 @@
-# beta01-setup-direct.ps1 BETA01 VM Setup Script - Direct Mount Version
+# BETA01 VM Setup Script - Direct Mount Version
 param(
     [Parameter(Mandatory=$true)]
     [string]$StorageAccountName,

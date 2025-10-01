@@ -82,7 +82,7 @@ variable "beta01_rg" {
 
 variable "mount_drive_letter" {
   type        = string
-  default     = "Z"
+  default     = "Y"
   description = "Drive letter to mount the Azure File Share on BETA01 (without colon)"
 }
 
@@ -118,7 +118,7 @@ data "azurerm_virtual_machine" "beta01" {
 
 # Create network interface for SQL VM without public IP
 resource "azurerm_network_interface" "win" {
-  name                = "nic-demo-win"
+  name                = "nic-usaw02-tst-win"
   location            = var.location
   resource_group_name = var.sql_rg
 
@@ -227,7 +227,7 @@ resource "azurerm_mssql_virtual_machine" "sql_extension" {
 
 # Storage Account for Backups
 resource "azurerm_storage_account" "backup" {
-  name                     = "sqldbbkup0003"
+  name                     = "sqldbbkup0009"
   resource_group_name      = var.sql_rg
   location                 = var.location
   account_tier             = "Standard"
@@ -243,7 +243,7 @@ resource "azurerm_storage_account" "backup" {
 
 # File Share for Backups
 resource "azurerm_storage_share" "backupshare" {
-  name                 = "sqldbbkupfs0003"
+  name                 = "sqldbbkupfs0009"
   storage_account_name = azurerm_storage_account.backup.name
   quota                = 1 # in GB
   depends_on = [
@@ -281,12 +281,11 @@ resource "time_sleep" "wait_for_storage" {
 
 # Upload SQL script to storage with templatefile processing
 resource "azurerm_storage_blob" "sql_script" {
-  name                   = "sql-setup-v2.ps1"
+  name                   = "sql-setup-fixed.ps1"
   storage_account_name   = azurerm_storage_account.backup.name
   storage_container_name = azurerm_storage_container.scripts.name
   type                   = "Block"
-  source = "${path.module}/sql-setup.ps1"
-  content_md5 = filemd5("${path.module}/sql-setup.ps1")
+  source                 = "${path.module}/sql-setup-fixed.ps1"
 
   depends_on = [
     azurerm_storage_account.backup,
@@ -298,11 +297,12 @@ resource "azurerm_storage_blob" "sql_script" {
 
 # Upload BETA01 script to storage with templatefile processing
 resource "azurerm_storage_blob" "beta01_script" {
-  name                   = "beta01-setup.ps1"
+  name                   = "beta01-setup-direct.ps1"
   storage_account_name   = azurerm_storage_account.backup.name
   storage_container_name = azurerm_storage_container.scripts.name
   type                   = "Block"
-  source = "${path.module}/beta01-setup.ps1"
+  source                 = "${path.module}/beta01-setup-direct.ps1"
+  content_md5            = filemd5("${path.module}/beta01-setup-direct.ps1")
 
   depends_on = [
     azurerm_storage_account.backup,
@@ -327,7 +327,7 @@ resource "azurerm_virtual_machine_extension" "sql_combined" {
   protected_settings = jsonencode({
     storageAccountName = azurerm_storage_account.backup.name
     storageAccountKey  = azurerm_storage_account.backup.primary_access_key
-    commandToExecute   = "powershell -ExecutionPolicy Unrestricted -File sql-setup-v2.ps1 -StorageAccountName \"${azurerm_storage_account.backup.name}\" -StorageAccountKey \"${azurerm_storage_account.backup.primary_access_key}\" -ShareName \"${azurerm_storage_share.backupshare.name}\" -DriveLetter \"${var.mount_drive_letter}\" -SqlPassword \"${var.sql_password}\""
+    commandToExecute   = "powershell -ExecutionPolicy Unrestricted -File sql-setup-fixed.ps1 -StorageAccountName \"${azurerm_storage_account.backup.name}\" -StorageAccountKey \"${azurerm_storage_account.backup.primary_access_key}\" -ShareName \"${azurerm_storage_share.backupshare.name}\" -DriveLetter \"${var.mount_drive_letter}\" -SqlPassword \"${var.sql_password}\""
   })
 
   depends_on = [
@@ -358,7 +358,7 @@ resource "azurerm_virtual_machine_extension" "beta01_combined" {
   protected_settings = jsonencode({
     storageAccountName = azurerm_storage_account.backup.name
     storageAccountKey  = azurerm_storage_account.backup.primary_access_key
-    commandToExecute   = "powershell -ExecutionPolicy Unrestricted -File beta01-setup.ps1 -StorageAccountName \"${azurerm_storage_account.backup.name}\" -StorageAccountKey \"${azurerm_storage_account.backup.primary_access_key}\" -ShareName \"${azurerm_storage_share.backupshare.name}\" -DriveLetter \"${var.mount_drive_letter}\""
+    commandToExecute   = "powershell -ExecutionPolicy Unrestricted -File beta01-setup-direct.ps1 -StorageAccountName \"${azurerm_storage_account.backup.name}\" -StorageAccountKey \"${azurerm_storage_account.backup.primary_access_key}\" -ShareName \"${azurerm_storage_share.backupshare.name}\" -DriveLetter \"${var.mount_drive_letter}\""
   })
 
   depends_on = [
