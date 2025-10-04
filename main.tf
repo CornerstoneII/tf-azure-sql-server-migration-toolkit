@@ -13,6 +13,10 @@ terraform {
       source  = "hashicorp/time"
       version = "~> 0.9.1"
     }
+    azapi = {
+      source  = "azure/azapi"
+      version = "~> 1.0"
+    }
   }
 }
 
@@ -118,7 +122,7 @@ data "azurerm_virtual_machine" "beta01" {
 
 # Create network interface for SQL VM without public IP
 resource "azurerm_network_interface" "win" {
-  name                = "nic-usaw02-tst-win"
+  name                = "nic-usaw02-tst"
   location            = var.location
   resource_group_name = var.sql_rg
 
@@ -139,6 +143,34 @@ resource "azurerm_user_assigned_identity" "sql_managed_identity" {
     Purpose = "Managed identity for SQL Server database operations"
     Project = "SQL-Migration"
   }
+}
+
+# Grant managed identity permissions for storage operations
+resource "azurerm_role_assignment" "mi_storage_file_contributor" {
+  scope                = azurerm_storage_account.backup.id
+  role_definition_name = "Storage File Data SMB Share Contributor"
+  principal_id         = azurerm_user_assigned_identity.sql_managed_identity.principal_id
+}
+
+resource "azurerm_role_assignment" "mi_storage_blob_reader" {
+  scope                = azurerm_storage_account.backup.id
+  role_definition_name = "Storage Blob Data Reader"
+  principal_id         = azurerm_user_assigned_identity.sql_managed_identity.principal_id
+}
+
+# Grant managed identity permissions to manage SQL VM Azure AD admin
+data "azurerm_client_config" "current" {}
+
+resource "azurerm_role_assignment" "mi_contributor" {
+  scope                = "/subscriptions/${data.azurerm_client_config.current.subscription_id}/resourceGroups/${var.sql_rg}"
+  role_definition_name = "Contributor"
+  principal_id         = azurerm_user_assigned_identity.sql_managed_identity.principal_id
+}
+
+resource "azurerm_role_assignment" "mi_reader" {
+  scope                = "/subscriptions/${data.azurerm_client_config.current.subscription_id}/resourceGroups/${var.sql_rg}"
+  role_definition_name = "Reader"
+  principal_id         = azurerm_user_assigned_identity.sql_managed_identity.principal_id
 }
 
 # Create WIN Server VM
@@ -238,13 +270,39 @@ resource "azurerm_mssql_virtual_machine" "sql_extension" {
 
   depends_on = [
     azurerm_virtual_machine_data_disk_attachment.data,
-    azurerm_virtual_machine_data_disk_attachment.temp
+    azurerm_virtual_machine_data_disk_attachment.temp,
+    azurerm_role_assignment.mi_storage_file_contributor,
+    azurerm_role_assignment.mi_storage_blob_reader,
+    azurerm_role_assignment.mi_contributor,
+    azurerm_role_assignment.mi_reader
   ]
+}
+
+# Set the managed identity as Azure AD admin using Azure CLI via null_resource
+resource "null_resource" "set_sql_vm_aad_admin" {
+  provisioner "local-exec" {
+    command     = <<-EOT
+      echo "Setting Azure AD admin for SQL VM..."
+      az sql vm ad-admin create --resource-group "${var.sql_rg}" --sql-vm-name "${var.win_vm_name}" --display-name "${azurerm_user_assigned_identity.sql_managed_identity.name}" --object-id "${azurerm_user_assigned_identity.sql_managed_identity.principal_id}" || echo "Azure AD admin creation completed with warnings"
+    EOT
+    interpreter = ["bash", "-c"]
+  }
+
+  depends_on = [
+    azurerm_mssql_virtual_machine.sql_extension,
+    azurerm_role_assignment.mi_contributor,
+    azurerm_role_assignment.mi_reader
+  ]
+
+  triggers = {
+    managed_identity_id = azurerm_user_assigned_identity.sql_managed_identity.id
+    sql_vm_id           = azurerm_mssql_virtual_machine.sql_extension.id
+  }
 }
 
 # Storage Account for Backups
 resource "azurerm_storage_account" "backup" {
-  name                     = "sqldbbkup0009"
+  name                     = "sqldbbkup0001"
   resource_group_name      = var.sql_rg
   location                 = var.location
   account_tier             = "Standard"
@@ -260,9 +318,9 @@ resource "azurerm_storage_account" "backup" {
 
 # File Share for Backups
 resource "azurerm_storage_share" "backupshare" {
-  name                 = "sqldbbkupfs0009"
-  storage_account_name = azurerm_storage_account.backup.name
-  quota                = 1 # in GB
+  name               = "sqldbbkupfs0001"
+  storage_account_id = azurerm_storage_account.backup.id
+  quota              = 1 # in GB
   depends_on = [
     azurerm_windows_virtual_machine.win,
     azurerm_storage_account.backup
@@ -272,7 +330,7 @@ resource "azurerm_storage_share" "backupshare" {
 # Create SQLBACKUPS directory in the file share
 resource "azurerm_storage_share_directory" "sqlbackups" {
   name             = "SQLBACKUPS"
-  storage_share_id = azurerm_storage_share.backupshare.id
+  storage_share_id = "https://${azurerm_storage_account.backup.name}.file.core.windows.net/${azurerm_storage_share.backupshare.name}"
   depends_on = [
     azurerm_storage_share.backupshare
   ]
@@ -280,8 +338,8 @@ resource "azurerm_storage_share_directory" "sqlbackups" {
 
 # Create a storage container for scripts
 resource "azurerm_storage_container" "scripts" {
-  name                  = "scripts"
-  storage_account_name  = azurerm_storage_account.backup.name
+  name                 = "scripts"
+  storage_account_name = azurerm_storage_account.backup.name
   container_access_type = "private"
 }
 
@@ -303,6 +361,7 @@ resource "azurerm_storage_blob" "sql_script" {
   storage_container_name = azurerm_storage_container.scripts.name
   type                   = "Block"
   source                 = "${path.module}/sql-setup-fixed.ps1"
+  content_md5            = filemd5("${path.module}/sql-setup-fixed.ps1")
 
   depends_on = [
     azurerm_storage_account.backup,
@@ -331,7 +390,7 @@ resource "azurerm_storage_blob" "beta01_script" {
 
 # SQL Server VM Extension - Download and execute script with improved error handling
 resource "azurerm_virtual_machine_extension" "sql_combined" {
-  name                 = "sql-combined-setup"
+  name                 = "sql-usaw02-setup"
   virtual_machine_id   = azurerm_windows_virtual_machine.win.id
   publisher            = "Microsoft.Compute"
   type                 = "CustomScriptExtension"
@@ -349,6 +408,7 @@ resource "azurerm_virtual_machine_extension" "sql_combined" {
 
   depends_on = [
     azurerm_mssql_virtual_machine.sql_extension,
+    null_resource.set_sql_vm_aad_admin,
     azurerm_storage_share_directory.sqlbackups,
     azurerm_storage_blob.sql_script,
     time_sleep.wait_for_storage
@@ -362,7 +422,7 @@ resource "azurerm_virtual_machine_extension" "sql_combined" {
 
 # BETA01 VM Extension - Download and execute script with improved error handling
 resource "azurerm_virtual_machine_extension" "beta01_combined" {
-  name                 = "beta01-combined-setup"
+  name                 = "beta01-usaw02-setup"
   virtual_machine_id   = data.azurerm_virtual_machine.beta01.id
   publisher            = "Microsoft.Compute"
   type                 = "CustomScriptExtension"
