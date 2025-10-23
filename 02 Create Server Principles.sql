@@ -1,16 +1,7 @@
 
---Bernard:  This script needs to be executed by the 'sa' (Thanos?) account -- use whatever you renamed 'sa' to on the new vm 
-
---=======================================================================================================================
---				CREATE MANAGED IDENTITY for Database Restoration
---=======================================================================================================================
-
--- Create login for the managed identity (replace with actual managed identity name)
-IF NOT EXISTS (SELECT * FROM sys.server_principals WHERE type = 'E' AND name = 'mi-sql-tst-win')
-BEGIN
-    CREATE LOGIN [mi-sql-tst-win] FROM EXTERNAL PROVIDER;
-    ALTER SERVER ROLE [sysadmin] ADD MEMBER [mi-sql-tst-win];
-END;
+-- This script is executed by the Yoda account (sysadmin) during automated deployment
+-- Managed identity login creation is handled separately by sql-setup-fixed.ps1
+-- This script focuses on creating Azure AD group logins and custom server roles
 
 --=======================================================================================================================
 --				CREATE AZURE Server Principals for EntraID GROUPS
@@ -64,7 +55,7 @@ end;
 if not exists (select *	  from sys.server_principals  where type = 'R' and name	 = 'EWN')
 begin
 
-	create server role EWN authorization Thanos;																																										--Bernard:  Thanos should be changed to whatever you created as the 'sa' account on the new vm
+	create server role EWN authorization Yoda;
 end;
 
 

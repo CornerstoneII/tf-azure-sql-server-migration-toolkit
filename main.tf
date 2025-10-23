@@ -22,7 +22,7 @@ terraform {
 
 provider "azurerm" {
   features {}
-  subscription_id = "52f9cc50-7e1e-4e82-b8c3-da2757e84a48"
+  subscription_id = ""
 }
 
 # Variables for SQL VM
@@ -133,6 +133,42 @@ resource "azurerm_network_interface" "win" {
   }
 }
 
+# Create Azure Private DNS Zone for name resolution
+resource "azurerm_private_dns_zone" "internal" {
+  name                = "ewn.local"
+  resource_group_name = var.sql_rg
+
+  tags = {
+    Purpose = "DNS resolution for Azure VMs"
+  }
+}
+
+# Link DNS Zone to VNet for automatic resolution with auto-registration
+resource "azurerm_private_dns_zone_virtual_network_link" "vnet_link" {
+  name                  = "link-vnet-nonprod-external-devtest"
+  resource_group_name   = var.sql_rg
+  private_dns_zone_name = azurerm_private_dns_zone.internal.name
+  virtual_network_id    = data.azurerm_virtual_network.main.id
+  registration_enabled  = true
+
+  tags = {
+    Purpose = "Enable DNS resolution for Azure VPN clients with auto-registration"
+  }
+}
+
+# Create DNS A record for SQL Server VM
+resource "azurerm_private_dns_a_record" "sql_vm" {
+  name                = "vm-usaw02-a22"
+  zone_name           = azurerm_private_dns_zone.internal.name
+  resource_group_name = var.sql_rg
+  ttl                 = 300
+  records             = [azurerm_network_interface.win.private_ip_address]
+
+  tags = {
+    Purpose = "DNS resolution for SQL Server VM"
+  }
+}
+
 # Create User-Assigned Managed Identity for SQL operations
 resource "azurerm_user_assigned_identity" "sql_managed_identity" {
   name                = "mi-sql-tst-win"
@@ -143,6 +179,140 @@ resource "azurerm_user_assigned_identity" "sql_managed_identity" {
     Purpose = "Managed identity for SQL Server database operations"
     Project = "SQL-Migration"
   }
+}
+
+# Get all directory role templates
+# data "azuread_directory_role_templates" "all" {}
+
+# Find the Directory Readers role template
+# locals {
+#   directory_readers_template = [
+#     for template in data.azuread_directory_role_templates.all.role_templates :
+#     template if template.display_name == "Directory Readers"
+#   ][0]
+# }
+
+# Assign Directory Readers role to the managed identity for Azure AD authentication
+# NOTE: Commented out due to insufficient privileges error (403)
+# Manual assignment required: TJ manually assigned Directory Readers role to mi-sql-tst-win
+# resource "azuread_directory_role_assignment" "mi_directory_readers" {
+#   role_id             = local.directory_readers_template.object_id
+#   principal_object_id = azurerm_user_assigned_identity.sql_managed_identity.principal_id
+#
+#   depends_on = [
+#     azurerm_user_assigned_identity.sql_managed_identity
+#   ]
+# }
+
+# Get user object IDs for Key Vault access policies
+data "azuread_user" "tina_admin" {
+  user_principal_name = "tina.weissenburg.admin@ewn.com"
+}
+
+data "azuread_user" "taylor_admin" {
+  user_principal_name = "taylor.buchanan.admin@ewn.com"
+}
+
+
+# Create Key Vault for storing SQL Server secrets
+resource "azurerm_key_vault" "sql_secrets" {
+  name                = "kv-sql-tst-win"
+  location            = var.location
+  resource_group_name = var.sql_rg
+  tenant_id           = data.azurerm_client_config.current.tenant_id
+  sku_name            = "standard"
+
+  enable_rbac_authorization  = false
+  purge_protection_enabled   = false
+  soft_delete_retention_days = 7
+
+  # Give managed identity access to Key Vault secrets
+  access_policy {
+    tenant_id = data.azurerm_client_config.current.tenant_id
+    object_id = azurerm_user_assigned_identity.sql_managed_identity.principal_id
+
+    secret_permissions = [
+      "Get",
+      "List"
+    ]
+  }
+
+  # Give current user/service principal access to manage secrets
+  access_policy {
+    tenant_id = data.azurerm_client_config.current.tenant_id
+    object_id = data.azurerm_client_config.current.object_id
+
+    secret_permissions = [
+      "Get",
+      "List",
+      "Set",
+      "Delete",
+      "Purge",
+      "Recover"
+    ]
+  }
+
+  # Give Tina Weissenburg admin access to get and list secrets
+  access_policy {
+    tenant_id = data.azurerm_client_config.current.tenant_id
+    object_id = data.azuread_user.tina_admin.object_id
+
+    secret_permissions = [
+      "Get",
+      "List"
+    ]
+  }
+
+  # Give Taylor Buchanan admin access to get and list secrets
+  access_policy {
+    tenant_id = data.azurerm_client_config.current.tenant_id
+    object_id = data.azuread_user.taylor_admin.object_id
+
+    secret_permissions = [
+      "Get",
+      "List"
+    ]
+  }
+
+
+  tags = {
+    Purpose = "SQL Server secrets storage"
+    Project = "SQL-Migration"
+  }
+}
+
+# Store SQL Server Yoda account password
+resource "azurerm_key_vault_secret" "sql_yoda_password" {
+  name         = "sql-yoda-password"
+  value        = var.sql_password
+  key_vault_id = azurerm_key_vault.sql_secrets.id
+
+  depends_on = [
+    azurerm_key_vault.sql_secrets
+  ]
+}
+
+# Store SQL Server admin password
+resource "azurerm_key_vault_secret" "sql_admin_password" {
+  name         = "sql-admin-password"
+  value        = var.admin_password
+  key_vault_id = azurerm_key_vault.sql_secrets.id
+
+  depends_on = [
+    azurerm_key_vault.sql_secrets
+  ]
+}
+
+# Store storage account access key
+resource "azurerm_key_vault_secret" "storage_account_key" {
+  name         = "storage-account-key"
+  value        = azurerm_storage_account.backup.primary_access_key
+  key_vault_id = azurerm_key_vault.sql_secrets.id
+
+  depends_on = [
+    azurerm_key_vault.sql_secrets,
+    azurerm_storage_account.backup
+  ]
 }
 
 # Grant managed identity permissions for storage operations
@@ -278,26 +448,27 @@ resource "azurerm_mssql_virtual_machine" "sql_extension" {
   ]
 }
 
-# Set the managed identity as Azure AD admin using Azure CLI via null_resource
-resource "null_resource" "set_sql_vm_aad_admin" {
-  provisioner "local-exec" {
-    command     = <<-EOT
-      echo "Setting Azure AD admin for SQL VM..."
-      az sql vm ad-admin create --resource-group "${var.sql_rg}" --sql-vm-name "${var.win_vm_name}" --display-name "${azurerm_user_assigned_identity.sql_managed_identity.name}" --object-id "${azurerm_user_assigned_identity.sql_managed_identity.principal_id}" || echo "Azure AD admin creation completed with warnings"
-    EOT
-    interpreter = ["bash", "-c"]
-  }
+# Enable Azure AD authentication and set managed identity as admin in one step
+resource "azapi_update_resource" "sql_vm_aad_admin" {
+  type        = "Microsoft.SqlVirtualMachine/sqlVirtualMachines@2022-02-01"
+  resource_id = azurerm_mssql_virtual_machine.sql_extension.id
+
+  body = jsonencode({
+    properties = {
+      azureADAuthenticationSettings = {
+        azureADAuthenticationEnabled = true
+        msiClientId                  = azurerm_user_assigned_identity.sql_managed_identity.client_id
+      }
+      sqlServerLicenseType = "PAYG"
+      sqlManagement        = "Full"
+    }
+  })
 
   depends_on = [
     azurerm_mssql_virtual_machine.sql_extension,
     azurerm_role_assignment.mi_contributor,
     azurerm_role_assignment.mi_reader
   ]
-
-  triggers = {
-    managed_identity_id = azurerm_user_assigned_identity.sql_managed_identity.id
-    sql_vm_id           = azurerm_mssql_virtual_machine.sql_extension.id
-  }
 }
 
 # Storage Account for Backups
@@ -338,8 +509,8 @@ resource "azurerm_storage_share_directory" "sqlbackups" {
 
 # Create a storage container for scripts
 resource "azurerm_storage_container" "scripts" {
-  name                 = "scripts"
-  storage_account_name = azurerm_storage_account.backup.name
+  name                  = "scripts"
+  storage_account_name  = azurerm_storage_account.backup.name
   container_access_type = "private"
 }
 
@@ -354,7 +525,8 @@ resource "time_sleep" "wait_for_storage" {
   create_duration = "90s"
 }
 
-# Upload SQL script to storage with templatefile processing
+# Upload SQL PowerShell setup script to storage
+# Note: SQL commands for Azure AD groups are now embedded in the PowerShell script
 resource "azurerm_storage_blob" "sql_script" {
   name                   = "sql-setup-fixed.ps1"
   storage_account_name   = azurerm_storage_account.backup.name
@@ -408,7 +580,7 @@ resource "azurerm_virtual_machine_extension" "sql_combined" {
 
   depends_on = [
     azurerm_mssql_virtual_machine.sql_extension,
-    null_resource.set_sql_vm_aad_admin,
+    azapi_update_resource.sql_vm_aad_admin,
     azurerm_storage_share_directory.sqlbackups,
     azurerm_storage_blob.sql_script,
     time_sleep.wait_for_storage
@@ -530,4 +702,55 @@ output "troubleshooting_info" {
     ]
   }
   description = "Locations of log files and debugging information"
+}
+
+# Output Key Vault information
+output "key_vault_info" {
+  value = {
+    name      = azurerm_key_vault.sql_secrets.name
+    id        = azurerm_key_vault.sql_secrets.id
+    vault_uri = azurerm_key_vault.sql_secrets.vault_uri
+    secrets = [
+      "sql-yoda-password",
+      "sql-admin-password",
+      "storage-account-key"
+    ]
+    authorized_users = [
+      "tina.weissenburg.admin@ewn.com",
+      "taylor.buchanan.admin@ewn.com"
+    ]
+    user_permissions = "Get, List secrets"
+  }
+  description = "Key Vault information and stored secrets"
+}
+
+# Output managed identity information
+output "managed_identity_info" {
+  value = {
+    name                  = azurerm_user_assigned_identity.sql_managed_identity.name
+    principal_id          = azurerm_user_assigned_identity.sql_managed_identity.principal_id
+    client_id             = azurerm_user_assigned_identity.sql_managed_identity.client_id
+    tenant_id             = azurerm_user_assigned_identity.sql_managed_identity.tenant_id
+    has_directory_readers = true
+    key_vault_access      = "Get, List secrets"
+  }
+  description = "Managed identity details and permissions"
+}
+
+# Output DNS information
+output "dns_info" {
+  value = {
+    dns_zone_name     = azurerm_private_dns_zone.internal.name
+    auto_registration = "enabled"
+    sql_vm_short_name = azurerm_private_dns_a_record.sql_vm.name
+    sql_vm_fqdn       = "${azurerm_private_dns_a_record.sql_vm.name}.${azurerm_private_dns_zone.internal.name}"
+    sql_vm_ip         = azurerm_network_interface.win.private_ip_address
+    connection_options = [
+      azurerm_private_dns_a_record.sql_vm.name,
+      "${azurerm_private_dns_a_record.sql_vm.name}.${azurerm_private_dns_zone.internal.name}",
+      azurerm_network_interface.win.private_ip_address
+    ]
+    note = "Auto-registration is enabled - VMs automatically register their names in DNS zone"
+  }
+  description = "DNS configuration - use any connection option in SSMS"
 }

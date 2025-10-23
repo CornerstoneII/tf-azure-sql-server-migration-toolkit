@@ -330,9 +330,48 @@ RECONFIGURE;
         exit 1
     }
 
-    # Azure AD admin is now configured by Terraform during deployment
-    Write-Log "Azure AD admin configuration handled by Terraform deployment"
-    Write-Log "Managed identity (mi-sql-tst-win) should already be configured as Azure AD admin"
+    # Configure managed identity as Azure AD admin using REST API
+    Write-Log "Configuring managed identity as Azure AD admin via REST API..."
+
+    try {
+        # Get access token using managed identity
+        $tokenResponse = Invoke-RestMethod -Uri "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" -Headers @{Metadata="true"} -Method GET
+        $accessToken = $tokenResponse.access_token
+
+        # Get managed identity details
+        $miResponse = Invoke-RestMethod -Uri "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" -Headers @{Metadata="true"} -Method GET
+        $subscriptionId = "52f9cc50-7e1e-4e82-b8c3-da2757e84a48"
+        $resourceGroup = "sql-pkr-img"
+        $sqlVmName = "vm-usaw02-a22"
+        $tenantId = "5469d93f-4b40-4153-b860-279b2c3d45e7"
+        $managedIdentityPrincipalId = "9fed00ed-fee3-464d-8cba-a83aa6b04dbf"
+
+        # Configure Azure AD admin via REST API
+        $headers = @{
+            'Authorization' = "Bearer $accessToken"
+            'Content-Type' = 'application/json'
+        }
+
+        $body = @{
+            properties = @{
+                administratorType = "ActiveDirectory"
+                login = "mi-sql-tst-win"
+                sid = $managedIdentityPrincipalId
+                tenantId = $tenantId
+            }
+        } | ConvertTo-Json -Depth 3
+
+        $uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.SqlVirtualMachine/sqlVirtualMachines/$sqlVmName/administrators/ActiveDirectory?api-version=2022-02-01"
+
+        Write-Log "Making REST API call to set Azure AD admin..."
+        $adminResponse = Invoke-RestMethod -Uri $uri -Method PUT -Headers $headers -Body $body
+        Write-Log "Azure AD admin configured successfully via REST API"
+        $requiresRestart = $true
+
+    } catch {
+        Write-Log "Failed to configure Azure AD admin via REST API: $($_.Exception.Message)" "WARNING"
+        Write-Log "Azure AD admin configuration may need to be done manually" "WARNING"
+    }
 
     # Restart SQL Server if Mixed Mode was changed or if Azure AD configuration requires it
     if ($requiresRestart) {
@@ -387,13 +426,13 @@ RECONFIGURE;
         if ($checkResult -like "*mi-sql-tst-win*") {
             Write-Log "Managed identity login already exists"
         } else {
-            # Create managed identity login using Yoda account
-            Write-Log "Creating managed identity login for database restoration..."
+            # Create managed identity login using Yoda account (without sysadmin privileges)
+            Write-Log "Creating managed identity login for web application access..."
             $createMILoginCmd = @"
 IF NOT EXISTS (SELECT * FROM sys.server_principals WHERE type = 'E' AND name = 'mi-sql-tst-win')
 BEGIN
     CREATE LOGIN [mi-sql-tst-win] FROM EXTERNAL PROVIDER;
-    ALTER SERVER ROLE [sysadmin] ADD MEMBER [mi-sql-tst-win];
+    -- Note: No sysadmin role - will be granted db-specific READ/WRITE access later
 END;
 "@
 
@@ -446,118 +485,308 @@ RECONFIGURE WITH OVERRIDE;
         Write-Log "Settings output: $settingsResult" "WARNING"
     }
 
-    # Step 7: Restore databases using Managed Identity
-#     Write-Log "=== STEP 7: Restoring databases using Managed Identity ==="
-#     $localBackupPath = "F:\SQLBackups"
+    # Step 7: Restore databases using Yoda account
+    Write-Log "=== STEP 7: Restoring databases using Yoda account ==="
+    $localBackupPath = "F:\SQLBackups"
 
-#     $localBackupFiles = Get-ChildItem -Path $localBackupPath -Filter "*.bak" -File -ErrorAction SilentlyContinue
+    $localBackupFiles = Get-ChildItem -Path $localBackupPath -Filter "*.bak" -File -ErrorAction SilentlyContinue
 
-#     if ($localBackupFiles.Count -eq 0) {
-#         Write-Log "No backup files found in local directory for restore - skipping database restore"
-#     } else {
-#         Write-Log "Found $($localBackupFiles.Count) backup files for restore"
+    if ($localBackupFiles.Count -eq 0) {
+        Write-Log "No backup files found in local directory for restore - skipping database restore"
+    } else {
+        Write-Log "Found $($localBackupFiles.Count) backup files for restore"
 
-#         Write-Log "Waiting for SQL Server service to be ready..."
-#         Start-Sleep -Seconds 30
+        Write-Log "Waiting for SQL Server service to be ready..."
+        Start-Sleep -Seconds 30
 
-#         # Test SQL Server connectivity with MANAGED IDENTITY ONLY
-#         $sqlReady = $false
-#         for ($i = 1; $i -le 10; $i++) {
-#             try {
-#                 Write-Log "Testing SQL Server connectivity with managed identity (attempt $i/10)..."
-#                 $testResult = sqlcmd -S localhost -G -Q "SELECT SUSER_NAME(), @@VERSION" -b -t 30 -C 2>&1
-#                 if ($LASTEXITCODE -eq 0) {
-#                     Write-Log "SQL Server ready with managed identity authentication"
-#                     Write-Log "Connected as: $testResult"
-#                     $sqlReady = $true
-#                     break
-#                 } else {
-#                     Write-Log "Managed identity connection failed: $testResult" "WARNING"
-#                 }
-#             } catch {
-#                 Write-Log "SQL connectivity test failed: $($_.Exception.Message)" "WARNING"
-#             }
-#             Write-Log "SQL Server not ready with managed identity, waiting 30 seconds..."
-#             Start-Sleep -Seconds 30
-#         }
+        # Test SQL Server connectivity with Yoda account for database restoration
+        $sqlReady = $false
+        for ($i = 1; $i -le 5; $i++) {
+            try {
+                Write-Log "Testing SQL Server connectivity with Yoda account (attempt $i/5)..."
+                $testResult = sqlcmd -S localhost -U Yoda -P "$SqlPassword" -Q "SELECT SUSER_NAME(), @@VERSION" -b -t 30 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Log "SQL Server ready - Yoda authentication successful"
+                    $sqlReady = $true
+                    break
+                } else {
+                    Write-Log "Yoda authentication failed: $testResult" "WARNING"
+                }
+            } catch {
+                Write-Log "SQL connectivity test failed: $($_.Exception.Message)" "WARNING"
+            }
+            if ($i -lt 5) {
+                Write-Log "SQL Server not ready, waiting 10 seconds..."
+                Start-Sleep -Seconds 10
+            }
+        }
 
-#         if (-not $sqlReady) {
-#             Write-Log "CRITICAL ERROR: SQL Server did not accept managed identity authentication after 10 attempts" "ERROR"
-#             Write-Log "Azure AD configuration failed - database restoration cannot proceed" "ERROR"
-#             Write-Log "Manual configuration required: Set Azure AD admin for SQL Server instance" "ERROR"
-#             exit 1
-#         } else {
-#             Write-Log "Enabling advanced SQL Server options using managed identity..."
-#             $enableCmd = "EXEC sp_configure 'show advanced options', 1; RECONFIGURE; EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE;"
-#             $enableResult = sqlcmd -S localhost -G -Q "$enableCmd" -b -t 30 -C 2>&1
-#             if ($LASTEXITCODE -eq 0) {
-#                 Write-Log "xp_cmdshell enabled successfully using managed identity"
-#             } else {
-#                 Write-Log "Failed to enable xp_cmdshell using managed identity: $enableResult" "ERROR"
-#                 exit 1
-#             }
+        if (-not $sqlReady) {
+            Write-Log "CRITICAL ERROR: SQL Server not ready for Yoda authentication after 5 attempts" "ERROR"
+            Write-Log "Database restoration cannot proceed" "ERROR"
+            exit 1
+        } else {
+            Write-Log "Enabling advanced SQL Server options using Yoda account..."
+            $enableCmd = "EXEC sp_configure 'show advanced options', 1; RECONFIGURE; EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE;"
+            $enableResult = sqlcmd -S localhost -U Yoda -P "$SqlPassword" -Q "$enableCmd" -b -t 30 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log "xp_cmdshell enabled successfully using Yoda account"
+            } else {
+                Write-Log "Failed to enable xp_cmdshell using Yoda account: $enableResult" "ERROR"
+                exit 1
+            }
 
-#             $databases = @(
-#                 @{Name="EWN"; File="EWN_Current.bak"},
-#                 @{Name="DataWarehouse"; File="Datawarehouse_Current.bak"},
-#                 @{Name="Quartz"; File="Quartz_Current.bak"},
-#                 @{Name="Rustici"; File="Rustici_Current.bak"},
-#                 @{Name="TestDB"; File="TestDB_Current.bak"}
-#             )
+            $databases = @(
+                @{Name="EWN"; File="EWN_Current.bak"},
+                @{Name="DataWarehouse"; File="Datawarehouse_Current.bak"},
+                @{Name="Quartz"; File="Quartz_Current.bak"},
+                @{Name="Rustici"; File="Rustici_Current.bak"},
+                @{Name="TestDB"; File="TestDB_Current.bak"}
+            )
 
-#             $restoredCount = 0
-#             foreach ($db in $databases) {
-#                 $backupFile = "F:\SQLBackups\$($db.File)"
+            # Databases that should have managed identity permissions (per 03 Grant Permissions SQL file)
+            $databasesWithMIAccess = @("EWN", "DataWarehouse", "Quartz", "Rustici")
 
-#                 if (Test-Path $backupFile) {
-#                     Write-Log "Restoring database: $($db.Name) from $backupFile using MANAGED IDENTITY"
+            $restoredCount = 0
+            foreach ($db in $databases) {
+                $backupFile = "F:\SQLBackups\$($db.File)"
 
-#                     $restoreCmd = "USE [master]; RESTORE DATABASE [$($db.Name)] FROM DISK = N'$backupFile' WITH FILE = 1, NOUNLOAD, REPLACE, STATS = 5"
+                if (Test-Path $backupFile) {
+                    Write-Log "Restoring database: $($db.Name) from $backupFile using YODA account"
 
-#                     Write-Log "Executing restore for $($db.Name) using managed identity..."
-#                     $restoreResult = sqlcmd -S localhost -G -Q "$restoreCmd" -b -t 1800 -C 2>&1
+                    $restoreCmd = "USE [master]; RESTORE DATABASE [$($db.Name)] FROM DISK = N'$backupFile' WITH FILE = 1, NOUNLOAD, REPLACE, STATS = 5"
 
-#                     if ($LASTEXITCODE -eq 0) {
-#                         Write-Log "SUCCESS: $($db.Name) restored successfully by MANAGED IDENTITY"
-#                         $restoredCount++
-#                     } else {
-#                         Write-Log "ERROR: $($db.Name) restore failed using managed identity (Exit Code: $LASTEXITCODE)" "ERROR"
-#                         Write-Log "Restore output: $restoreResult" "ERROR"
-#                         Write-Log "CRITICAL: Database restoration must use managed identity only - terminating" "ERROR"
-#                         exit 1
-#                     }
-#                 } else {
-#                     Write-Log "WARNING: Backup file not found: $backupFile" "WARNING"
-#                 }
-#             }
+                    Write-Log "Executing restore for $($db.Name) using Yoda account..."
+                    $restoreResult = sqlcmd -S localhost -U Yoda -P "$SqlPassword" -Q "$restoreCmd" -b -t 1800 2>&1
 
-#             Write-Log "Disabling xp_cmdshell for security using managed identity..."
-#             $disableCmd = "EXEC sp_configure 'xp_cmdshell', 0; RECONFIGURE; EXEC sp_configure 'show advanced options', 0; RECONFIGURE;"
-#             $disableResult = sqlcmd -S localhost -G -Q "$disableCmd" -b -t 30 -C 2>&1
-#             if ($LASTEXITCODE -eq 0) {
-#                 Write-Log "xp_cmdshell disabled successfully using managed identity"
-#             } else {
-#                 Write-Log "Failed to disable xp_cmdshell: $disableResult" "WARNING"
-#             }
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Log "SUCCESS: $($db.Name) restored successfully by YODA"
+                        $restoredCount++
 
-#             Write-Log "Verifying restored databases using managed identity..."
-#             $verifyCmd = "SELECT name, state_desc, create_date FROM sys.databases WHERE name IN ('EWN', 'DataWarehouse', 'Quartz', 'Rustici', 'TestDB')"
-#             $dbStatus = sqlcmd -S localhost -G -Q "$verifyCmd" -b -t 30 -C 2>&1
+                        # Grant managed identity permissions only for databases specified in 03 Grant Permissions SQL file
+                        if ($databasesWithMIAccess -contains $db.Name) {
+                            Write-Log "Granting managed identity READ/WRITE/EXECUTE access to $($db.Name)..."
+                            $grantAccessCmd = @"
+USE [$($db.Name)];
+-- Create user if not exists
+IF NOT EXISTS (SELECT * FROM sys.database_principals WHERE type = 'E' AND name = 'mi-sql-tst-win')
+BEGIN
+    CREATE USER [mi-sql-tst-win] FROM LOGIN [mi-sql-tst-win];
+END;
 
-#             if ($LASTEXITCODE -eq 0) {
-#                 Write-Log "Database Status:"
-#                 $dbStatus | ForEach-Object {
-#                     if ($_ -and $_ -notmatch "rows affected" -and $_.Trim() -ne "") {
-#                         Write-Log "  $_"
-#                     }
-#                 }
-#                 Write-Log "Successfully restored $restoredCount out of $($databases.Count) databases using MANAGED IDENTITY"
-#             } else {
-#                 Write-Log "Failed to verify databases: $dbStatus" "ERROR"
-#                 exit 1
-#             }
-#         }
-#     }
+-- Grant read/write permissions
+ALTER ROLE [db_datareader] ADD MEMBER [mi-sql-tst-win];
+ALTER ROLE [db_datawriter] ADD MEMBER [mi-sql-tst-win];
+
+-- Grant execute permission (create role if it doesn't exist)
+IF NOT EXISTS (SELECT * FROM sys.database_principals WHERE name = 'db_executor' AND type = 'R')
+BEGIN
+    CREATE ROLE [db_executor];
+    GRANT EXECUTE TO [db_executor];
+END;
+ALTER ROLE [db_executor] ADD MEMBER [mi-sql-tst-win];
+"@
+
+                            $accessResult = sqlcmd -S localhost -U Yoda -P "$SqlPassword" -Q "$grantAccessCmd" -b -t 60 2>&1
+                            if ($LASTEXITCODE -eq 0) {
+                                Write-Log "SUCCESS: Managed identity granted READ/WRITE/EXECUTE access to $($db.Name)"
+                            } else {
+                                Write-Log "WARNING: Failed to grant managed identity access to $($db.Name): $accessResult" "WARNING"
+                            }
+                        } else {
+                            Write-Log "SKIPPED: $($db.Name) does not require managed identity access per configuration"
+                        }
+
+                    } else {
+                        Write-Log "ERROR: $($db.Name) restore failed using Yoda account (Exit Code: $LASTEXITCODE)" "ERROR"
+                        Write-Log "Restore output: $restoreResult" "ERROR"
+                        exit 1
+                    }
+                } else {
+                    Write-Log "WARNING: Backup file not found: $backupFile" "WARNING"
+                }
+            }
+
+            Write-Log "Disabling xp_cmdshell for security using Yoda account..."
+            $disableCmd = "EXEC sp_configure 'xp_cmdshell', 0; RECONFIGURE; EXEC sp_configure 'show advanced options', 0; RECONFIGURE;"
+            $disableResult = sqlcmd -S localhost -U Yoda -P "$SqlPassword" -Q "$disableCmd" -b -t 30 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log "xp_cmdshell disabled successfully for security"
+            } else {
+                Write-Log "Failed to disable xp_cmdshell: $disableResult" "WARNING"
+            }
+
+            Write-Log "Verifying restored databases using Yoda account..."
+            $verifyCmd = "SELECT name, state_desc, create_date FROM sys.databases WHERE name IN ('EWN', 'DataWarehouse', 'Quartz', 'Rustici', 'TestDB')"
+            $dbStatus = sqlcmd -S localhost -U Yoda -P "$SqlPassword" -Q "$verifyCmd" -b -t 30 2>&1
+
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log "Database Status:"
+                $dbStatus | ForEach-Object {
+                    if ($_ -and $_ -notmatch "rows affected" -and $_.Trim() -ne "") {
+                        Write-Log "  $_"
+                    }
+                }
+                Write-Log "Successfully restored $restoredCount out of $($databases.Count) databases using YODA account"
+                
+                # Test managed identity connectivity only for databases with MI access
+                Write-Log "Testing managed identity connectivity to databases with configured access..."
+                foreach ($dbName in $databasesWithMIAccess) {
+                    $testCmd = "USE [$dbName]; SELECT DB_NAME() as CurrentDB, USER_NAME() as CurrentUser, IS_MEMBER('db_datareader') as CanRead, IS_MEMBER('db_datawriter') as CanWrite, IS_MEMBER('db_executor') as CanExecute"
+                    Write-Log "Testing managed identity access to $dbName..."
+                    $testResult = sqlcmd -S localhost -G -Q "$testCmd" -b -t 30 -C 2>&1
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Log "SUCCESS: Managed identity can access $dbName"
+                        Write-Log "  Access details: $testResult"
+                    } else {
+                        Write-Log "WARNING: Managed identity cannot access ${dbName}" "WARNING"
+                        Write-Log "  Error details: $testResult" "WARNING"
+                    }
+                }
+                Write-Log "Note: TestDB does not have managed identity access (not required per configuration)"
+            } else {
+                Write-Log "Failed to verify databases: $dbStatus" "ERROR"
+                exit 1
+            }
+        }
+    }
+
+    # Step 8: Create Azure AD Group Logins and Server Roles
+    Write-Log "=== STEP 8: Creating Azure AD Group Logins and Custom Server Roles ==="
+
+    # Define SQL batches for creating Azure AD group logins and server roles
+    # This is embedded SQL from 02 Create Server Principles.sql
+    $sqlBatches = @(
+        @"
+-- Create Azure AD Group Logins
+use MASTER;
+
+if not exists (select * from sys.server_principals where type = 'X' and name = 'SoftwareEngineering')
+begin
+    create login SoftwareEngineering from external provider with DEFAULT_DATABASE = [Master];
+end;
+
+if not exists (select * from sys.server_principals where type = 'X' and name = 'ProductInnovation')
+begin
+    create login ProductInnovation from external provider with DEFAULT_DATABASE = [Master];
+end;
+
+if not exists (select * from sys.server_principals where type = 'X' and name = 'ProductExcellence')
+begin
+    create login ProductExcellence from external provider with DEFAULT_DATABASE = [Master];
+end;
+
+if not exists (select * from sys.server_principals where type = 'X' and name = 'DataSystems')
+begin
+    create login DataSystems from external provider with DEFAULT_DATABASE = [Master];
+end;
+
+if not exists (select * from sys.server_principals where type = 'X' and name = 'SQLAdmins-Dev')
+begin
+    create login [SQLAdmins-Dev] from external provider with DEFAULT_DATABASE = [Master];
+end;
+
+ALTER SERVER ROLE [sysadmin] ADD MEMBER [SQLAdmins-Dev];
+
+if not exists (select * from sys.server_principals where type = 'X' and name = 'KMS Web Developers')
+begin
+    create login [KMS Web Developers] from external provider with DEFAULT_DATABASE = [master];
+end;
+"@,
+        @"
+-- Create Custom Server Role
+if not exists (select * from sys.server_principals where type = 'R' and name = 'EWN')
+begin
+    create server role EWN authorization Yoda;
+end;
+
+grant view any definition to EWN;
+grant view server state to EWN;
+GRANT ALTER ANY EVENT SESSION TO EWN;
+
+alter server role EWN add member SoftwareEngineering;
+alter server role EWN add member ProductInnovation;
+alter server role EWN add member DataSystems;
+alter server role EWN add member ProductExcellence;
+"@,
+        @"
+-- Grant Database Permissions - DataWarehouse
+use DataWarehouse;
+alter role db_owner add member SoftwareEngineering;
+alter role db_owner add member DataSystems;
+alter role db_owner add member ProductInnovation;
+alter role db_owner add member ProductExcellence;
+GRANT SHOWPLAN TO SoftwareEngineering;
+GRANT SHOWPLAN TO DataSystems;
+GRANT SHOWPLAN TO ProductInnovation;
+GRANT SHOWPLAN TO ProductExcellence;
+"@,
+        @"
+-- Grant Database Permissions - EWN
+use EWN;
+alter role db_owner add member SoftwareEngineering;
+alter role db_owner add member DataSystems;
+alter role db_owner add member ProductInnovation;
+alter role db_owner add member ProductExcellence;
+GRANT SHOWPLAN TO SoftwareEngineering;
+GRANT SHOWPLAN TO DataSystems;
+GRANT SHOWPLAN TO ProductInnovation;
+GRANT SHOWPLAN TO ProductExcellence;
+"@,
+        @"
+-- Grant Database Permissions - Rustici
+use Rustici;
+alter role db_owner add member SoftwareEngineering;
+alter role db_owner add member DataSystems;
+alter role db_owner add member ProductInnovation;
+alter role db_owner add member ProductExcellence;
+GRANT SHOWPLAN TO SoftwareEngineering;
+GRANT SHOWPLAN TO DataSystems;
+GRANT SHOWPLAN TO ProductInnovation;
+GRANT SHOWPLAN TO ProductExcellence;
+"@,
+        @"
+-- Grant Database Permissions - Quartz
+use Quartz;
+alter role db_owner add member SoftwareEngineering;
+alter role db_owner add member DataSystems;
+alter role db_owner add member ProductInnovation;
+alter role db_owner add member ProductExcellence;
+GRANT SHOWPLAN TO SoftwareEngineering;
+GRANT SHOWPLAN TO DataSystems;
+GRANT SHOWPLAN TO ProductInnovation;
+GRANT SHOWPLAN TO ProductExcellence;
+"@
+    )
+
+    # Execute each SQL batch
+    $batchNumber = 0
+    $successCount = 0
+    $failCount = 0
+
+    foreach ($batch in $sqlBatches) {
+        $batchNumber++
+        Write-Log "Executing Azure AD group setup batch $batchNumber..."
+
+        $batchResult = sqlcmd -S localhost -U Yoda -P "$SqlPassword" -Q "$batch" -b -t 60 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Log "  Batch $batchNumber executed successfully"
+            $successCount++
+        } else {
+            Write-Log "  WARNING: Batch $batchNumber had issues: $batchResult" "WARNING"
+            $failCount++
+        }
+    }
+
+    Write-Log "Azure AD group setup complete: $successCount successful, $failCount warnings"
+
+    # Verify SQLAdmins-Dev was created
+    $verifyAdmins = sqlcmd -S localhost -U Yoda -P "$SqlPassword" -Q "SELECT name, type_desc FROM sys.server_principals WHERE name = 'SQLAdmins-Dev'" -b -t 30 2>&1
+    if ($LASTEXITCODE -eq 0 -and $verifyAdmins -like "*SQLAdmins-Dev*") {
+        Write-Log "SUCCESS: SQLAdmins-Dev Azure AD group login created successfully"
+    } else {
+        Write-Log "WARNING: SQLAdmins-Dev login may not have been created" "WARNING"
+    }
 
     Write-Log "=== SQL Server VM Configuration Completed Successfully ==="
 
